@@ -45,17 +45,34 @@ class ShieldAccessibilityService : AccessibilityService() {
         "network & internet", "connected devices", "passwords & security",
         "additional settings", "about phone", "lock screen & password", "special features"
     )
-    // Activity class-name fragments that identify explicitly permitted connectivity pages.
+    private var settingsHome = false
+    // Never blockable by the app-block list (would break Settings, permissions, installers, calling, launcher).
+    private val protectedPackages = setOf(
+        "com.android.settings", "com.miui.securitycenter", "com.miui.powerkeeper",
+        "com.android.systemui", "com.android.phone", "com.android.server.telecom",
+        "com.google.android.permissioncontroller", "com.android.permissioncontroller",
+        "com.google.android.packageinstaller", "com.android.packageinstaller",
+        "com.miui.packageinstaller", "com.coloros.safecenter", "com.oplus.settings",
+        "com.android.providers.settings"
+    )
+    private fun isProtectedPackage(pkg: String) =
+        pkg == packageName || pkg == launcherPkg || pkg in protectedPackages
+    // Activity class-name fragments that are always allowed (Wi-Fi, Bluetooth, hotspot pages and panels)
     private val allowedClassTokens = listOf("wifi", "bluetooth", "tether", "hotspot", "networkprovider", "settingspanel")
+    private var settingsAllowed = false
     private var lastStateChange = 0L
     private var lastLockdownScan = 0L
     private var lastSettingsClass = ""
 
     // WhatsApp
     private val whatsappPkgs = setOf("com.whatsapp", "com.whatsapp.w4b")
-    private val channelWords = setOf("channels", "find channels", "explore channels")
+    private val channelWords = setOf("find channels", "explore channels")
+    private var waPausedUntil = 0L
+    private val waActions = ArrayList<Long>()
     private var lastWa = 0L
     private var lastWaAction = 0L
+    private var lastBeat = 0L
+    private var lastDump = 0L
 
     private val settingsPackages = setOf(
         "com.android.settings", "com.google.android.packageinstaller",
@@ -81,20 +98,6 @@ class ShieldAccessibilityService : AccessibilityService() {
         )?.activityInfo?.packageName
     }
 
-    // Safety exclusion: these packages must never be blocked by the user app-block list.
-    // This prevents accidental loss of access to Settings, system UI, permissions, installers or calling.
-    private val protectedPackages = setOf(
-        "com.android.settings", "com.miui.securitycenter", "com.miui.powerkeeper",
-        "com.android.systemui", "com.android.phone", "com.android.server.telecom",
-        "com.google.android.permissioncontroller", "com.android.permissioncontroller",
-        "com.google.android.packageinstaller", "com.android.packageinstaller",
-        "com.miui.packageinstaller", "com.coloros.safecenter", "com.oplus.settings",
-        "com.android.providers.settings"
-    )
-
-    private fun isProtectedPackage(pkg: String): Boolean =
-        pkg == packageName || pkg == launcherPkg || pkg in protectedPackages
-
     override fun onServiceConnected() {
         classifier = NsfwClassifier(this).takeIf { it.available }
     }
@@ -102,14 +105,17 @@ class ShieldAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
         e ?: return
         val pkg = e.packageName?.toString() ?: return
+        heartbeat(e, pkg)
         if (pkg == packageName || pkg == "com.android.systemui") return
         val type = e.eventType
+        if (pkg !in lockdownPackages && type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) settingsAllowed = false
+
+        if (Prefs.enabled(this, Prefs.DEBUG, false) && (pkg in whatsappPkgs || pkg in lockdownPackages)) dumpScreen(e, pkg)
 
         // 1) Blocked apps
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             Prefs.enabled(this, Prefs.APPS_ON, true) &&
-            !isProtectedPackage(pkg) &&
-            pkg in Prefs.strings(this, Prefs.BLOCKED_APPS)
+            !isProtectedPackage(pkg) && pkg in Prefs.strings(this, Prefs.BLOCKED_APPS)
         ) {
             punish("app blocked"); return
         }
@@ -170,72 +176,89 @@ class ShieldAccessibilityService : AccessibilityService() {
         }
     }
 
-    // ---------- Settings lockdown (allow-list) ----------
-    private fun lockdownActive() =
-        guardActive() && Prefs.enabled(this, Prefs.SETTINGS_LOCKDOWN, false)
+    // ---------- Diagnostics ----------
+    private fun heartbeat(e: AccessibilityEvent, pkg: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastBeat < 1000) return
+        lastBeat = now
+        val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+        Prefs.putString(this, "dbg_last_event", "$time  $pkg  ${e.className}")
+    }
 
-    /** Returns true when the current Settings screen must be blocked.
-     * Re-evaluate the visible page on every event. Do not keep an "allowed" flag:
-     * MIUI often reuses one Activity while navigating from Wi-Fi back to Settings home.
-     */
+    /** Saves what the service can see on screen (only while Diagnostics is switched on). */
+    private fun dumpScreen(e: AccessibilityEvent, pkg: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastDump < 1500) return
+        lastDump = now
+        val root = rootInActiveWindow ?: return
+        val h = resources.displayMetrics.heightPixels.coerceAtLeast(1)
+        val parts = ArrayList<String>()
+        fun walk(n: AccessibilityNodeInfo, depth: Int, budget: IntArray) {
+            if (budget[0]-- <= 0 || depth > 30 || parts.size > 60) return
+            val t = n.text?.toString()?.trim().orEmpty()
+            val d = n.contentDescription?.toString()?.trim().orEmpty()
+            val label = (t + if (d.isNotEmpty()) " [$d]" else "").trim()
+            if (label.isNotEmpty()) {
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                parts.add("${r.top * 100 / h}%: ${label.take(40)}${if (n.isSelected) " (selected)" else ""}")
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, depth + 1, budget) }
+        }
+        walk(root, 0, intArrayOf(300))
+        val key = if (pkg in whatsappPkgs) "dbg_screen_wa" else "dbg_screen_settings"
+        Prefs.putString(this, key, "$pkg | ${e.className}\n" + parts.joinToString("\n").take(1500))
+    }
+
+    // ---------- Settings lockdown (allow-list) ----------
+    // Active while the switch is ON. With a PIN set it also pauses during the unlock window.
+    private fun lockdownActive() =
+        Prefs.enabled(this, Prefs.SETTINGS_LOCKDOWN, false) &&
+            (!Guard.hasPin(this) || !Guard.isUnlocked(this))
+
+    /** Returns true when the current Settings screen must be blocked. */
     private fun settingsLockdown(e: AccessibilityEvent): Boolean {
         val now = SystemClock.elapsedRealtime()
         val isState = e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
         val cls = e.className?.toString()?.lowercase() ?: ""
-        if (isState) {
+        // Dialogs/popups (android.*) keep the state of the page below them.
+        if (isState && !cls.startsWith("android.") && !cls.startsWith("androidx.")) {
+            settingsAllowed = allowedClassTokens.any { cls.contains(it) }
+            settingsHome = cls.contains("miuisettings") || cls.contains("homepage")
             lastStateChange = now
             lastSettingsClass = cls
         }
-        if (!isState && now - lastLockdownScan < 180) return false
+        if (settingsAllowed) return false
+        if (!isState && now - lastLockdownScan < 200) return false
         lastLockdownScan = now
-
         val root = rootInActiveWindow ?: return false
         val header = headerTexts(root)
-        val currentClass = if (cls.isNotBlank()) cls else lastSettingsClass
-
-        // Allow only a positively identified connectivity subpage. The Settings
-        // landing page is blocked even when its list contains Wi-Fi/Bluetooth rows.
-        if (isSettingsHome(currentClass, header)) {
-            recordBlock(header)
-            return true
-        }
-        if (isAllowedSettingsPage(currentClass, header)) return false
-
-        // Accessibility tree may be empty while MIUI is transitioning between pages.
-        if (now - lastStateChange < 900) {
-            handler.removeCallbacks(settingsRecheck)
-            handler.postDelayed(settingsRecheck, 950)
+        if (headerAllowed(header)) { settingsAllowed = true; return false }
+        if (now - lastStateChange < 700) {
+            // Page may still be loading; look again shortly.
+            handler.postDelayed({ recheckSettings() }, 750)
             return false
         }
         recordBlock(header)
         return true
     }
 
-    private val settingsRecheck = Runnable {
-        if (!lockdownActive()) return@Runnable
-        val root = rootInActiveWindow ?: return@Runnable
-        val pkg = root.packageName?.toString() ?: return@Runnable
-        if (pkg !in lockdownPackages) return@Runnable
+    private fun recheckSettings() {
+        if (!lockdownActive() || settingsAllowed) return
+        val root = rootInActiveWindow ?: return
+        val p = root.packageName?.toString() ?: return
+        if (p !in lockdownPackages) return
         val header = headerTexts(root)
-        val cls = lastSettingsClass
-        if (isSettingsHome(cls, header) || !isAllowedSettingsPage(cls, header)) {
-            recordBlock(header)
-            punish("settings locked")
-        }
+        if (headerAllowed(header)) { settingsAllowed = true; return }
+        recordBlock(header)
+        punish("settings locked")
     }
 
-    private fun isSettingsHome(cls: String, header: List<String>): Boolean {
-        if (cls.contains("miuisettings") || cls.contains("settingshomepage") || cls.contains("homepage")) return true
-        // Common Settings landing-page headings. Keep this exact to avoid blocking
-        // a subpage merely because its parent tree contains the word Settings.
-        val homeTitles = setOf("settings", "search settings", "settings home", "all settings")
-        return header.take(3).any { it in homeTitles } || header.any { it in homepageMarkers }
-    }
-
-    private fun isAllowedSettingsPage(cls: String, header: List<String>): Boolean {
-        if (allowedClassTokens.any { cls.contains(it) }) return true
-        val allowed = Prefs.allowedSettings(this).map { it.trim().lowercase() }.filter { it.isNotEmpty() }
-        return header.any { h -> allowed.any { a -> h == a || h.startsWith("$a ") } }
+    private fun headerAllowed(header: List<String>): Boolean {
+        // MIUI's Settings home lists "Wi-Fi" and "Bluetooth" rows near the top, so a title match alone is not enough.
+        if (settingsHome || header.any { it in homepageMarkers }) return false
+        val allowed = Prefs.allowedSettings(this)
+        return header.any { it in allowed }
     }
 
     private fun recordBlock(header: List<String>) {
@@ -260,57 +283,73 @@ class ShieldAccessibilityService : AccessibilityService() {
         return out
     }
 
-    // ---------- WhatsApp: block only when Channels/Updates is the SELECTED tab ----------
+    // ---------- WhatsApp: block Channels / Updates tab ----------
     private fun checkWhatsApp(e: AccessibilityEvent): Boolean {
         val now = SystemClock.elapsedRealtime()
-        if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && now - lastWa < 220) return false
-        lastWa = now
-        val root = rootInActiveWindow ?: return false
-
-        // A tab label can remain visible on the main WhatsApp page even when it is
-        // not open. Never block merely because the word "Channels" exists.
-        val selectedBlockedTab = selectedTabName(root, false, intArrayOf(500), 0)
-        if (!selectedBlockedTab) return false
-
-        // Return to Chats only if its tab is actually present and clickable.
-        // Never use GLOBAL_ACTION_BACK as a fallback: that can exit WhatsApp.
-        if (now - lastWaAction < 800) return true
-        val movedToChats = goToChatsTab(root)
-        if (movedToChats) {
-            lastWaAction = now
-            Toast.makeText(this, "Shield: WhatsApp Channels / Updates blocked", Toast.LENGTH_SHORT).show()
-            Prefs.increment(this, "a11y_blocks")
-            return true
+        if (now < waPausedUntil) return false
+        val cls = e.className?.toString()?.lowercase() ?: ""
+        var rule: String? = if (cls.contains("newsletter")) "class:$cls" else null // WhatsApp's internal name for Channels
+        var root: AccessibilityNodeInfo? = null
+        if (rule == null) {
+            if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && now - lastWa < 250) return false
+            lastWa = now
+            root = rootInActiveWindow
+            if (root == null) return false
+            rule = channelsUi(root, false, intArrayOf(400), 0)
         }
-        // If WhatsApp exposes no accessible Chats control, fail open rather than
-        // closing the app or navigating to an unrelated screen.
-        return false
+        if (rule == null) return false
+        if (now - lastWaAction < 800) return true
+        lastWaAction = now
+
+        // Safety valve: if this keeps firing, pause the rule so WhatsApp never becomes unusable.
+        waActions.add(now)
+        waActions.removeAll { now - it > 10_000L }
+        if (waActions.size >= 4) {
+            waActions.clear()
+            waPausedUntil = now + 60_000L
+            Prefs.putString(this, "last_wa_block", "PAUSED 60s after repeated hits. Last rule: $rule | $cls")
+            Toast.makeText(this, "Shield: WhatsApp rule paused for 1 min (see Diagnostics)", Toast.LENGTH_LONG).show()
+            return false
+        }
+
+        Prefs.putString(this, "last_wa_block", "$rule | $cls")
+        val r = root ?: rootInActiveWindow
+        val clicked = r != null && goToChatsTab(r)
+        // Back is used only for screens WhatsApp itself names as Channels ("newsletter"); never for tab guesses.
+        if (!clicked && rule.startsWith("class:")) performGlobalAction(GLOBAL_ACTION_BACK)
+        Toast.makeText(this, "Shield: WhatsApp Channels blocked", Toast.LENGTH_SHORT).show()
+        Prefs.increment(this, "a11y_blocks")
+        return true
     }
 
-    private fun selectedTabName(n: AccessibilityNodeInfo, parentSelected: Boolean, budget: IntArray, depth: Int): Boolean {
-        if (budget[0]-- <= 0 || depth > 30) return false
+    /** Returns a description of the matching rule, or null. Plain "Channels" text is NOT used (it appears on other screens). */
+    private fun channelsUi(n: AccessibilityNodeInfo, parentSelected: Boolean, budget: IntArray, depth: Int): String? {
+        if (budget[0]-- <= 0 || depth > 30) return null
         val t = n.text?.toString()?.trim()?.lowercase()
         val d = n.contentDescription?.toString()?.trim()?.lowercase()
-        val label = t ?: d
-        val selected = n.isSelected || parentSelected
-        if (selected && (label == "channels" || label == "updates" || label == "newsletter")) return true
-        val thisSelected = n.isSelected
+        if (t != null && t in channelWords) return "phrase:$t"
+        if (d != null && d in channelWords) return "phrase:$d"
+        if ((t == "updates" || d == "updates") && (n.isSelected || parentSelected)) return "updates-tab-selected"
+        val sel = n.isSelected
         for (i in 0 until n.childCount) {
             val c = n.getChild(i) ?: continue
-            if (selectedTabName(c, thisSelected, budget, depth + 1)) return true
+            val r = channelsUi(c, sel, budget, depth + 1)
+            if (r != null) return r
         }
-        return false
+        return null
     }
 
     private fun goToChatsTab(root: AccessibilityNodeInfo): Boolean {
         val found = root.findAccessibilityNodeInfosByText("Chats") ?: return false
-        for (n in found) {
-            val label = n.text?.toString()?.trim()
-            val desc = n.contentDescription?.toString()?.trim()
-            if (!label.equals("Chats", true) && !desc.equals("Chats", true)) continue
+        val r = Rect()
+        val tabs = found.filter {
+            it.text?.toString()?.trim().equals("Chats", true) ||
+                it.contentDescription?.toString()?.trim()?.startsWith("Chats", true) == true
+        }.sortedByDescending { it.getBoundsInScreen(r); r.top }
+        for (n in tabs) {
             var c: AccessibilityNodeInfo? = n
             var hops = 0
-            while (c != null && !c.isClickable && hops++ < 5) c = c.parent
+            while (c != null && !c.isClickable && hops++ < 4) c = c.parent
             if (c != null && c.isClickable && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
         }
         return false
