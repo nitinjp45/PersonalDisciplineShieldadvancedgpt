@@ -15,12 +15,14 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLPeerUnverifiedException
 import kotlin.concurrent.thread
 
 /**
@@ -51,6 +53,12 @@ class DnsVpnService : VpnService() {
     )
 
     private val tcpSessions = ConcurrentHashMap<String, TcpSession>()
+
+    // Reuse one strict DoT connection to avoid a TLS handshake for every DNS query.
+    private val dotLock = Any()
+    private var dotSocket: SSLSocket? = null
+    private var dotEndpointKey: String? = null
+    private var dotBootstrapIp: String? = null
 
     companion object {
         const val ACTION_STOP = "com.personaldisciplineshield.ACTION_STOP"
@@ -219,6 +227,7 @@ class DnsVpnService : VpnService() {
         recoveryHandler.removeCallbacksAndMessages(null)
         running = false
         tcpSessions.clear()
+        closeDotConnection()
         Prefs.setVpnActive(this, false)
         try { vpn?.close() } catch (_: Exception) {}
         vpn = null
@@ -233,6 +242,7 @@ class DnsVpnService : VpnService() {
         recoveryHandler.removeCallbacksAndMessages(null)
         running = false
         tcpSessions.clear()
+        closeDotConnection()
         Prefs.setVpnActive(this, false)
         try { vpn?.close() } catch (_: Exception) {}
         vpn = null
@@ -333,7 +343,7 @@ class DnsVpnService : VpnService() {
         val answer = forwardDnsUdp(query)
         if (answer == null) {
             Prefs.increment(this, "dns_errors")
-            Prefs.setLastDnsError(this, "UDP DNS forwarding failed for $domain")
+            Prefs.setLastDnsError(this, "Encrypted DNS-over-TLS forwarding failed for $domain")
         }
         return answer
     }
@@ -410,94 +420,170 @@ class DnsVpnService : VpnService() {
         return labels.joinToString(".").lowercase()
     }
 
-    private fun forwardDnsUdp(query: ByteArray): ByteArray? {
-        for (server in listOf("1.1.1.1", "8.8.8.8", "9.9.9.9")) {
-            var socket: DatagramSocket? = null
-            try {
-                socket = DatagramSocket()
-                if (!protect(socket)) {
-                    Prefs.setLastDnsError(this, "protect(UDP socket) failed for $server")
-                    continue
-                }
-                socket.soTimeout = 3000
-                val address = InetAddress.getByName(server)
-                socket.connect(address, DNS_PORT)
-                socket.send(DatagramPacket(query, query.size, address, DNS_PORT))
-                val buffer = ByteArray(4096)
-                val incoming = DatagramPacket(buffer, buffer.size)
-                socket.receive(incoming)
-                val response = buffer.copyOf(incoming.length)
-                if (validDnsResponse(query, response)) {
-                    Prefs.setLastDnsError(this, "SUCCESS: UDP DNS response received from $server")
-                    return response
-                }
-            } catch (e: Exception) {
-                Prefs.setLastDnsError(this, "$server UDP: ${e.javaClass.simpleName}: ${e.message}")
-            } finally {
-                try { socket?.close() } catch (_: Exception) {}
-            }
-        }
-        return null
-    }
+    // Both intercepted UDP and TCP DNS requests are forwarded using strict DNS-over-TLS.
+    // There is deliberately no plaintext DNS fallback.
+    private fun forwardDnsUdp(query: ByteArray): ByteArray? = forwardDnsOverTls(query)
 
-    private fun forwardDnsTcp(query: ByteArray): ByteArray? {
+    private fun forwardDnsTcp(query: ByteArray): ByteArray? = forwardDnsOverTls(query)
+
+    private fun forwardDnsOverTls(query: ByteArray): ByteArray? = synchronized(dotLock) {
+        if (query.size !in 12..65535) return@synchronized null
+
+        val endpoint = Prefs.dnsEndpoint(this)
+        if (endpoint == null) {
+            Prefs.setLastDnsError(
+                this,
+                "DNS provider is invalid. Check the custom hostname and bootstrap IPv4 address."
+            )
+            Prefs.increment(this, "dns_errors")
+            return@synchronized null
+        }
+
+        val endpointKey = "${endpoint.hostname}|${endpoint.bootstrapIps.joinToString(",")}"
+
+        // Switching provider closes the previous provider's encrypted connection.
+        if (dotEndpointKey != endpointKey) closeDotConnection()
+
         val diagnostics = ArrayList<String>()
-        for (server in listOf("1.1.1.1", "8.8.8.8", "9.9.9.9")) {
-            var socket: Socket? = null
-            var stage = "socket-create"
+
+        // First try the existing persistent TLS connection.
+        val existing = dotSocket
+        if (existing != null && !existing.isClosed && existing.isConnected) {
             try {
-                socket = Socket()
-                // Diagnostic experiment: bind an ephemeral local port before VPN protection.
-                // protect() must still happen before connect().
-                stage = "bind"
-                socket.bind(InetSocketAddress(0))
-                stage = "protect"
-                val protected = protect(socket)
-                if (!protected) {
-                    diagnostics.add(
-                        "$server protect=false(closed=${socket.isClosed},connected=${socket.isConnected}," +
-                            "bound=${socket.isBound})"
-                    )
-                    continue
-                }
-                diagnostics.add("$server protect=true")
-                stage = "connect"
-                socket.tcpNoDelay = true
-                socket.connect(InetSocketAddress(server, DNS_PORT), 3500)
-                stage = "write"
-                socket.soTimeout = 4000
-                val out = DataOutputStream(socket.getOutputStream())
-                out.writeShort(query.size)
-                out.write(query)
-                out.flush()
-                stage = "read-length"
-                val input = DataInputStream(socket.getInputStream())
-                val length = input.readUnsignedShort()
-                if (length < 12 || length > 65535) {
-                    diagnostics.add("$server invalid-response-length=$length")
-                    continue
-                }
-                stage = "read-body"
-                val response = ByteArray(length)
-                input.readFully(response)
-                if (validDnsResponse(query, response)) {
-                    Prefs.setLastDnsError(this, "SUCCESS: TCP DNS response received from $server")
-                    return response
-                }
-                diagnostics.add("$server invalid-DNS-response")
+                val response = exchangeDot(existing, query)
+                Prefs.setLastDnsError(
+                    this,
+                    "SUCCESS: persistent DoT ${endpoint.hostname}:853 via $dotBootstrapIp"
+                )
+                return@synchronized response
             } catch (e: Exception) {
-                diagnostics.add("$server $stage=${e.javaClass.simpleName}:${e.message}")
-            } finally {
-                try { socket?.close() } catch (_: Exception) {}
+                diagnostics.add(
+                    "$dotBootstrapIp reused-connection=${e.javaClass.simpleName}:${e.message ?: "failed"}"
+                )
+                closeDotConnection()
             }
         }
+
+        // Bootstrap IPs are numeric and are used only for the TCP route.
+        // TLS SNI and certificate verification always use endpoint.hostname.
+        for (bootstrapIp in endpoint.bootstrapIps) {
+            var candidate: SSLSocket? = null
+            try {
+                candidate = connectDot(endpoint, bootstrapIp)
+                val response = exchangeDot(candidate, query)
+
+                dotSocket = candidate
+                dotEndpointKey = endpointKey
+                dotBootstrapIp = bootstrapIp
+                candidate = null // ownership transferred to dotSocket
+
+                Prefs.setLastDnsError(
+                    this,
+                    "SUCCESS: DoT ${endpoint.hostname}:853 via $bootstrapIp"
+                )
+                return@synchronized response
+            } catch (e: Exception) {
+                diagnostics.add(
+                    "$bootstrapIp ${e.javaClass.simpleName}:${e.message ?: "failed"}"
+                )
+            } finally {
+                try { candidate?.close() } catch (_: Exception) {}
+            }
+        }
+
+        closeDotConnection()
+        Prefs.increment(this, "dns_errors")
         Prefs.setLastDnsError(
             this,
-            "TCP upstream attempts: " + diagnostics.joinToString(" | ") +
-                " | vpnActive=${Prefs.isVpnActive(this)} running=$running " +
-                "sdk=${Build.VERSION.SDK_INT} thread=${Thread.currentThread().name}"
+            "DoT failed for ${endpoint.hostname}: " + diagnostics.joinToString(" | ")
         )
-        return null
+        null
+    }
+
+    private fun connectDot(
+        endpoint: Prefs.DnsEndpoint,
+        bootstrapIp: String
+    ): SSLSocket {
+        val raw = Socket()
+        try {
+            // Bind first, then protect, then connect. This prevents the upstream
+            // connection from being routed back into this VPN's virtual DNS.
+            raw.bind(InetSocketAddress(0))
+            if (!protect(raw)) {
+                throw java.io.IOException("VpnService.protect(socket) returned false")
+            }
+
+            val address = InetAddress.getByName(bootstrapIp) // numeric IPv4 bootstrap only
+            raw.connect(InetSocketAddress(address, 853), 4500)
+            raw.tcpNoDelay = true
+            raw.soTimeout = 5000
+
+            // The bootstrap IP is used for routing; hostname is used for TLS SNI
+            // and certificate identity verification.
+            val tls = (SSLSocketFactory.getDefault() as SSLSocketFactory)
+                .createSocket(raw, endpoint.hostname, 853, true) as SSLSocket
+
+            tls.soTimeout = 5000
+
+            val supported = tls.supportedProtocols.toSet()
+            val secureProtocols = listOf("TLSv1.3", "TLSv1.2")
+                .filter { it in supported }
+            if (secureProtocols.isEmpty()) {
+                tls.close()
+                throw java.io.IOException("TLS 1.2 or newer is unavailable")
+            }
+            tls.enabledProtocols = secureProtocols.toTypedArray()
+
+            tls.startHandshake()
+
+            // Verify the certificate identity against the DoT hostname.
+            // The layered socket hostname supplies SNI; this checks the peer name.
+            if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(
+                    endpoint.hostname, tls.session
+                )
+            ) {
+                tls.close()
+                throw SSLPeerUnverifiedException(
+                    "TLS certificate does not match ${endpoint.hostname}"
+                )
+            }
+
+            return tls
+        } catch (e: Exception) {
+            try { raw.close() } catch (_: Exception) {}
+            throw e
+        }
+    }
+
+    private fun exchangeDot(socket: SSLSocket, query: ByteArray): ByteArray {
+        val output = DataOutputStream(socket.outputStream)
+        output.writeShort(query.size)
+        output.write(query)
+        output.flush()
+
+        val input = DataInputStream(socket.inputStream)
+        val responseLength = input.readUnsignedShort()
+        if (responseLength < 12) {
+            throw java.io.IOException("Invalid DoT response length: $responseLength")
+        }
+
+        val response = ByteArray(responseLength)
+        input.readFully(response)
+
+        if (!validDnsResponse(query, response)) {
+            throw java.io.IOException("DNS response validation failed")
+        }
+
+        return response
+    }
+
+    private fun closeDotConnection() {
+        synchronized(dotLock) {
+            try { dotSocket?.close() } catch (_: Exception) {}
+            dotSocket = null
+            dotEndpointKey = null
+            dotBootstrapIp = null
+        }
     }
 
     private fun validDnsResponse(query: ByteArray, response: ByteArray): Boolean =
