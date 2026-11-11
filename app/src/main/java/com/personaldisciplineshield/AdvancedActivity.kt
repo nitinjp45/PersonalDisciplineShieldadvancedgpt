@@ -21,6 +21,24 @@ class AdvancedActivity : Activity() {
     private lateinit var kwList: LinearLayout
     private lateinit var allowedList: LinearLayout
     private lateinit var blockedView: TextView
+    private lateinit var diagView: TextView
+    private lateinit var blockedAppsView: TextView
+    private lateinit var lockdownStatusView: TextView
+    private lateinit var waStatusView: TextView
+    // Settings-type apps are handled by the Settings lockdown, never by the app blocker.
+    private val hiddenApps: Set<String> by lazy {
+        val home = packageManager.resolveActivity(
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0
+        )?.activityInfo?.packageName
+        setOf(
+            "com.android.settings", "com.miui.securitycenter", "com.miui.powerkeeper",
+            "com.android.systemui", "com.android.phone", "com.android.server.telecom",
+            "com.google.android.permissioncontroller", "com.android.permissioncontroller",
+            "com.google.android.packageinstaller", "com.android.packageinstaller",
+            "com.miui.packageinstaller", "com.coloros.safecenter", "com.oplus.settings",
+            "com.coloros.settings", "com.android.providers.settings"
+        ) + listOfNotNull(home)
+    }
     private lateinit var content: LinearLayout
     private val admin by lazy { ComponentName(this, ShieldAdminReceiver::class.java) }
     private val dpm by lazy { getSystemService(DevicePolicyManager::class.java) }
@@ -81,7 +99,8 @@ class AdvancedActivity : Activity() {
 
     private fun build() {
         content.addView(TextView(this).apply {
-            text = "Advanced protection"; textSize = 22f
+            val ver = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { "?" }
+            text = "Advanced protection  (build $ver)"; textSize = 22f
             setTypeface(null, Typeface.BOLD); setTextColor(0xFF172033.toInt())
         })
 
@@ -107,14 +126,14 @@ class AdvancedActivity : Activity() {
         content.addView(note("Tip: ask a trusted person to set the PIN so you do not know it."))
 
         // ---- Device admin ----
-        section("DEVICE ADMIN (screen-lock safeguard)")
+        section("DEVICE ADMIN (uninstall speed-bump + screen lock)")
         adminStatus = TextView(this).apply { textSize = 14f }
         content.addView(adminStatus)
         content.addView(button("Enable Device Admin") {
             startActivity(Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
                 .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, admin)
                 .putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION,
-                    "Allows Shield to lock the screen after repeated blocking events. Standard Device Admin does not prevent uninstall."))
+                    "Makes uninstalling require removing this admin first, and lets Shield lock the screen after repeated blocked attempts."))
         }, lp())
         content.addView(button("Remove Device Admin (needs unlock)") {
             if (!Guard.require(this)) return@button
@@ -148,11 +167,13 @@ class AdvancedActivity : Activity() {
 
         // ---- Settings lockdown ----
         section("SETTINGS APP LOCKDOWN (allow only some pages)")
-        toggle("Lock Settings app (only pages listed below stay open)", Prefs.SETTINGS_LOCKDOWN, false)
+        toggle("Lock Settings app (only pages listed below stay open)", Prefs.SETTINGS_LOCKDOWN, false) { refresh() }
+        lockdownStatusView = TextView(this).apply { textSize = 13f; setTypeface(null, Typeface.BOLD) }
+        content.addView(lockdownStatusView)
         content.addView(button("Open Wi-Fi settings") { openSettings(Settings.ACTION_WIFI_SETTINGS) }, lp())
         content.addView(button("Open Bluetooth settings") { openSettings(Settings.ACTION_BLUETOOTH_SETTINGS) }, lp())
         content.addView(button("Open Hotspot settings") { openHotspot() }, lp())
-        content.addView(note("Wi-Fi, Bluetooth and Hotspot also work from the Quick Settings tiles (swipe down); those are never blocked. Long-press a tile to open its page. Requires a PIN to be set; it blocks the Settings home page and unknown pages while the PIN is locked. Wi-Fi, Bluetooth and Hotspot pages remain allowed."))
+        content.addView(note("Wi-Fi, Bluetooth and Hotspot also work from the Quick Settings tiles (swipe down); those are never blocked. Long-press a tile to open its page. Lockdown is active whenever the switch is ON; once a PIN is set it also pauses during the unlock window."))
         val allowInput = EditText(this).apply { hint = "allowed page title, e.g. wi-fi"; setSingleLine(true) }
         content.addView(allowInput, lp())
         content.addView(button("Allow this Settings page title") {
@@ -176,7 +197,10 @@ class AdvancedActivity : Activity() {
         // ---- WhatsApp ----
         section("WHATSAPP")
         toggle("Block Channels / Updates tab in WhatsApp", Prefs.WA_CHANNELS, true)
-        content.addView(note("Only blocks when Channels or Updates is the currently selected tab. It returns to Chats when that tab control is available; it never presses Back or closes WhatsApp. WhatsApp must NOT be in your blocked apps list. Works best with English tab labels."))
+        content.addView(note("Chats, calls and groups stay open. Channels sit inside the Updates tab together with Status, so the whole Updates tab is blocked. WhatsApp must NOT be in your blocked apps list. Works with the English WhatsApp interface."))
+
+        waStatusView = TextView(this).apply { textSize = 12f; setTextColor(0xFF6B7280.toInt()) }
+        content.addView(waStatusView)
 
         // ---- Keywords ----
         section("BLOCKED KEYWORDS")
@@ -197,6 +221,12 @@ class AdvancedActivity : Activity() {
         section("BLOCKED APPS")
         toggle("App blocking", Prefs.APPS_ON, true)
         content.addView(button("Choose apps to block") { pickApps() }, lp())
+        blockedAppsView = TextView(this).apply { textSize = 13f }
+        content.addView(blockedAppsView)
+        content.addView(button("Clear all blocked apps (needs unlock)") {
+            if (!Guard.require(this)) return@button
+            Prefs.saveStrings(this, Prefs.BLOCKED_APPS, emptySet()); refresh()
+        }, lp())
 
         // ---- Images ----
         section("EXPLICIT IMAGE GUARD (experimental)")
@@ -204,6 +234,23 @@ class AdvancedActivity : Activity() {
         imageStatus = TextView(this).apply { textSize = 13f }
         content.addView(imageStatus)
         content.addView(note("Needs Android 11+ and a model file at assets/nsfw.tflite. Accuracy depends on the model; expect misses and false alarms."))
+
+        // ---- Diagnostics ----
+        section("DIAGNOSTICS (use this if something does not block)")
+        content.addView(Switch(this).apply {
+            text = "Record on-screen text for WhatsApp / Settings"
+            textSize = 15f
+            isChecked = Prefs.enabled(this@AdvancedActivity, Prefs.DEBUG, false)
+            setOnCheckedChangeListener { _, on -> Prefs.setEnabled(this@AdvancedActivity, Prefs.DEBUG, on) }
+        }, lp())
+        content.addView(note("Switch on, open WhatsApp > Updates tab (NOT a chat), then Settings > Wi-Fi, come back here and tap Refresh. The saved text is whatever was on screen, so never record while a private chat is open, and clear it after use."))
+        diagView = TextView(this).apply { textSize = 11f; setTextIsSelectable(true) }
+        content.addView(diagView)
+        content.addView(button("Refresh diagnostics") { refresh() }, lp())
+        content.addView(button("Clear recorded text") {
+            Prefs.remove(this, "dbg_screen_wa"); Prefs.remove(this, "dbg_screen_settings"); Prefs.remove(this, "dbg_last_event")
+            refresh()
+        }, lp())
 
         refresh()
     }
@@ -260,32 +307,15 @@ class AdvancedActivity : Activity() {
         }
     }
 
-    private fun isProtectedAppPackage(pkg: String): Boolean {
-        val protected = setOf(
-            "com.android.settings", "com.miui.securitycenter", "com.miui.powerkeeper",
-            "com.android.systemui", "com.android.phone", "com.android.server.telecom",
-            "com.google.android.permissioncontroller", "com.android.permissioncontroller",
-            "com.google.android.packageinstaller", "com.android.packageinstaller",
-            "com.miui.packageinstaller", "com.coloros.safecenter", "com.oplus.settings",
-            "com.android.providers.settings"
-        )
-        val home = packageManager.resolveActivity(
-            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0
-        )?.activityInfo?.packageName
-        return pkg == home || pkg in protected
-    }
-
     private fun pickApps() {
         val pm = packageManager
         val launch = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val apps = pm.queryIntentActivities(launch, 0)
             .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
-            .filter { it.first != packageName && !isProtectedAppPackage(it.first) }
+            .filter { it.first != packageName && it.first !in hiddenApps }
             .distinctBy { it.first }
             .sortedBy { it.second.lowercase() }
-        val saved = Prefs.strings(this, Prefs.BLOCKED_APPS)
-        val current = saved.filterNot { isProtectedAppPackage(it) }.toMutableSet()
-        if (current != saved) Prefs.saveStrings(this, Prefs.BLOCKED_APPS, current)
+        val current = Prefs.strings(this, Prefs.BLOCKED_APPS)
         val checked = BooleanArray(apps.size) { apps[it].first in current }
         AlertDialog.Builder(this).setTitle("Block these apps")
             .setMultiChoiceItems(apps.map { it.second }.toTypedArray(), checked) { _, i, b -> checked[i] = b }
@@ -293,13 +323,17 @@ class AdvancedActivity : Activity() {
                 val chosen = apps.filterIndexed { i, _ -> checked[i] }.map { it.first }.toMutableSet()
                 // keep entries for apps no longer launchable
                 val kept = current.filter { p -> apps.none { it.first == p } }
-                chosen.addAll(kept)
-                if ((current - chosen).isNotEmpty() && !Guard.require(this)) return@setPositiveButton
+                chosen.addAll(kept.filter { it !in hiddenApps })
+                if (((current - hiddenApps) - chosen).isNotEmpty() && !Guard.require(this)) return@setPositiveButton
                 Prefs.saveStrings(this, Prefs.BLOCKED_APPS, chosen)
                 toast("${chosen.size} app(s) blocked")
             }
             .setNegativeButton("Cancel", null).show()
     }
+
+    private fun appLabel(p: String): String = try {
+        packageManager.getApplicationLabel(packageManager.getApplicationInfo(p, 0)).toString()
+    } catch (_: Exception) { p }
 
     private fun a11yEnabled(): Boolean {
         val s = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
@@ -314,13 +348,34 @@ class AdvancedActivity : Activity() {
             else -> "Lock: LOCKED"
         }
         adminStatus.text = if (dpm.isAdminActive(admin)) {
-            if (dpm.isDeviceOwnerApp(packageName)) "Device Admin: ACTIVE (Device Owner policies available)"
-            else "Device Admin: ACTIVE (screen-lock safeguard; uninstall is NOT blocked)"
+            if (dpm.isDeviceOwnerApp(packageName)) "Device Admin: ACTIVE (Device Owner: hard uninstall block)"
+            else "Device Admin: ACTIVE (uninstall needs admin removal first; not a hard block)"
         } else "Device Admin: OFF"
         a11yStatus.text = if (a11yEnabled()) "Accessibility: ON" else "Accessibility: OFF (required for most features)"
         val hasModel = try { assets.list("")?.contains("nsfw.tflite") == true } catch (_: Exception) { false }
         imageStatus.text = "Model: ${if (hasModel) "found" else "missing"}  |  Android 11+: ${Build.VERSION.SDK_INT >= 30}"
         blockedView.text = "Last blocked Settings screen: ${Prefs.getString(this, "last_settings_block") ?: "none yet"}"
+        val blockedNow = Prefs.strings(this, Prefs.BLOCKED_APPS).map { appLabel(it) }.sorted()
+        blockedAppsView.text = if (blockedNow.isEmpty()) "Blocked apps: none" else "Blocked apps: " + blockedNow.joinToString(", ")
+        val armed = Guard.hasPin(this)
+        val lockdownOn = Prefs.enabled(this, Prefs.SETTINGS_LOCKDOWN, false)
+        val guardOn = Prefs.enabled(this, Prefs.SETTINGS_GUARD, true)
+        val lockdownActive = lockdownOn && (!armed || !Guard.isUnlocked(this))
+        lockdownStatusView.text = when {
+            !lockdownOn -> "Status: OFF (switch is off)"
+            !armed -> "Status: ACTIVE (no PIN set; switch it off here to get Settings back)"
+            Guard.isUnlocked(this) -> "Status: PAUSED (unlock window open)"
+            else -> "Status: ACTIVE (locked)"
+        }
+        waStatusView.text = "Last WhatsApp block: ${Prefs.getString(this, "last_wa_block") ?: "none yet"}"
+        diagView.text = "Accessibility service enabled: ${a11yEnabled()}\n" +
+            "PIN set: $armed   unlocked right now: ${Guard.isUnlocked(this)}\n" +
+            "Settings lockdown switch: $lockdownOn   guard switch: $guardOn\n" +
+            "=> Settings lockdown active now: $lockdownActive\n" +
+            "WhatsApp channel block switch: ${Prefs.enabled(this, Prefs.WA_CHANNELS, true)}\n" +
+            "Last event seen by service: ${Prefs.getString(this, "dbg_last_event") ?: "none (service not receiving events)"}\n\n" +
+            "--- WhatsApp screen ---\n${Prefs.getString(this, "dbg_screen_wa") ?: "-"}\n\n" +
+            "--- Settings screen ---\n${Prefs.getString(this, "dbg_screen_settings") ?: "-"}"
     }
 
     private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
