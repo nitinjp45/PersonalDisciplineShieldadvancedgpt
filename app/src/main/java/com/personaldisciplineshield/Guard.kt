@@ -1,9 +1,9 @@
 package com.personaldisciplineshield
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Base64
 import android.widget.Toast
-import android.os.SystemClock
 import java.security.MessageDigest
 import java.security.SecureRandom
 
@@ -39,6 +39,13 @@ object Guard {
         return hash(pin, salt) == Prefs.getString(c, PIN_HASH)
     }
 
+    /** Uses the monotonic clock (changing the phone's date cannot shorten the wait).
+     *  A value from before a reboot is impossible in the new boot, so it is treated as "none". */
+    private fun unlockAt(c: Context): Long {
+        val v = Prefs.getLong(c, UNLOCK_AT)
+        return if (v > SystemClock.elapsedRealtime() + DELAY_MS) 0L else v
+    }
+
     fun requestUnlock(c: Context) =
         Prefs.putLong(c, UNLOCK_AT, SystemClock.elapsedRealtime() + DELAY_MS)
 
@@ -47,20 +54,17 @@ object Guard {
     /** No PIN set = guard not armed = everything is changeable. */
     fun isUnlocked(c: Context): Boolean {
         if (!hasPin(c)) return true
-        val at = Prefs.getLong(c, UNLOCK_AT)
+        val at = unlockAt(c)
         val now = SystemClock.elapsedRealtime()
-        // elapsedRealtime resets at reboot, so a pending/open window expires safely.
         return at in 1L..now && now < at + WINDOW_MS
     }
 
     fun waitingMs(c: Context): Long {
-        val at = Prefs.getLong(c, UNLOCK_AT)
-        return (at - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        return (unlockAt(c) - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
     }
 
     fun openRemainingMs(c: Context): Long {
-        val at = Prefs.getLong(c, UNLOCK_AT)
-        return (at + WINDOW_MS - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        return (unlockAt(c) + WINDOW_MS - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
     }
 
     /** Call before any action that weakens protection. */
