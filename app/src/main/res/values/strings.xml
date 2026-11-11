@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="a11y_description">Personal self-control tool. Reads on-screen text only on this device to block your chosen keywords and apps, protect its own settings from being switched off on impulse, and (optionally) detect explicit images. Nothing is sent off the device.</string>
+</resources>
