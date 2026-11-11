@@ -67,8 +67,6 @@ class ShieldAccessibilityService : AccessibilityService() {
     // WhatsApp
     private val whatsappPkgs = setOf("com.whatsapp", "com.whatsapp.w4b")
     private val channelWords = setOf("find channels", "explore channels")
-    private var waPausedUntil = 0L
-    private val waActions = ArrayList<Long>()
     private var lastWa = 0L
     private var lastWaAction = 0L
     private var lastBeat = 0L
@@ -258,7 +256,13 @@ class ShieldAccessibilityService : AccessibilityService() {
         // MIUI's Settings home lists "Wi-Fi" and "Bluetooth" rows near the top, so a title match alone is not enough.
         if (settingsHome || header.any { it in homepageMarkers }) return false
         val allowed = Prefs.allowedSettings(this)
-        return header.any { it in allowed }
+        // MIUI/Android may label the Bluetooth pairing flow "Pair new device".
+        val pairingFlow = header.any { h ->
+            h.contains("pair new device") || h.contains("pairing") ||
+                h.contains("available devices") || h.contains("bluetooth")
+        }
+        if (pairingFlow) return true
+        return header.any { h -> allowed.any { token -> h == token || h.contains(token) } }
     }
 
     private fun recordBlock(header: List<String>) {
@@ -286,7 +290,6 @@ class ShieldAccessibilityService : AccessibilityService() {
     // ---------- WhatsApp: block Channels / Updates tab ----------
     private fun checkWhatsApp(e: AccessibilityEvent): Boolean {
         val now = SystemClock.elapsedRealtime()
-        if (now < waPausedUntil) return false
         val cls = e.className?.toString()?.lowercase() ?: ""
         var rule: String? = if (cls.contains("newsletter")) "class:$cls" else null // WhatsApp's internal name for Channels
         var root: AccessibilityNodeInfo? = null
@@ -298,20 +301,11 @@ class ShieldAccessibilityService : AccessibilityService() {
             rule = channelsUi(root, false, intArrayOf(400), 0)
         }
         if (rule == null) return false
-        if (now - lastWaAction < 800) return true
+        if (now - lastWaAction < 1200) return true
         lastWaAction = now
 
-        // Safety valve: if this keeps firing, pause the rule so WhatsApp never becomes unusable.
-        waActions.add(now)
-        waActions.removeAll { now - it > 10_000L }
-        if (waActions.size >= 4) {
-            waActions.clear()
-            waPausedUntil = now + 60_000L
-            Prefs.putString(this, "last_wa_block", "PAUSED 60s after repeated hits. Last rule: $rule | $cls")
-            Toast.makeText(this, "Shield: WhatsApp rule paused for 1 min (see Diagnostics)", Toast.LENGTH_LONG).show()
-            return false
-        }
-
+        // Do not pause protection after a fixed number of accessibility events.
+        // WhatsApp emits several events for one tab transition.
         Prefs.putString(this, "last_wa_block", "$rule | $cls")
         val r = root ?: rootInActiveWindow
         val clicked = r != null && goToChatsTab(r)
@@ -341,16 +335,16 @@ class ShieldAccessibilityService : AccessibilityService() {
 
     private fun goToChatsTab(root: AccessibilityNodeInfo): Boolean {
         val found = root.findAccessibilityNodeInfosByText("Chats") ?: return false
-        val r = Rect()
-        val tabs = found.filter {
-            it.text?.toString()?.trim().equals("Chats", true) ||
-                it.contentDescription?.toString()?.trim()?.startsWith("Chats", true) == true
-        }.sortedByDescending { it.getBoundsInScreen(r); r.top }
-        for (n in tabs) {
+        for (n in found) {
+            val label = n.text?.toString()?.trim()
+                ?: n.contentDescription?.toString()?.trim().orEmpty()
+            if (!label.equals("Chats", true)) continue
             var c: AccessibilityNodeInfo? = n
             var hops = 0
-            while (c != null && !c.isClickable && hops++ < 4) c = c.parent
-            if (c != null && c.isClickable && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            while (c != null && !c.isClickable && hops++ < 5) c = c.parent
+            if (c != null && c.isClickable &&
+                c.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            ) return true
         }
         return false
     }
