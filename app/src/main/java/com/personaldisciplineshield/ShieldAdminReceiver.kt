@@ -7,7 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 
-/** Standard Device Admin can support screen locking; OS-level uninstall blocking requires Device Owner. */
+/** Active device admin: normal uninstall requires deactivating admin first (a speed bump). A hard block needs Device Owner. */
 class ShieldAdminReceiver : DeviceAdminReceiver() {
 
     override fun onEnabled(context: Context, intent: Intent) {
@@ -15,7 +15,7 @@ class ShieldAdminReceiver : DeviceAdminReceiver() {
     }
 
     override fun onDisableRequested(context: Context, intent: Intent): CharSequence =
-        "Turning this off disables Shield admin safeguards. Standard Device Admin does not prevent uninstall."
+        "Turning this off removes the uninstall speed-bump and the screen-lock safeguard of Personal Discipline Shield."
 
     companion object {
         /**
