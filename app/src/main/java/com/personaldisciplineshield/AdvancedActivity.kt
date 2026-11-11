@@ -91,6 +91,11 @@ class AdvancedActivity : Activity() {
         val et = EditText(this).apply {
             inputType = if (password) InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
             else InputType.TYPE_CLASS_TEXT
+            if (password) {
+                // Mask PIN digits and prevent keyboard suggestions/autofill.
+                isSingleLine = true
+                importantForAutofill = android.view.View.IMPORTANT_FOR_AUTOFILL_NO
+            }
         }
         AlertDialog.Builder(this).setTitle(title).setView(et)
             .setPositiveButton("OK") { _, _ -> onOk(et.text.toString().trim()) }
