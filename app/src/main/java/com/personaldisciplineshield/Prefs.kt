@@ -28,7 +28,8 @@ object Prefs {
         "wi-fi", "wifi", "internet", "bluetooth", "hotspot", "tethering",
         "hotspot & tethering", "wi-fi hotspot", "mobile hotspot", "portable hotspot",
         "mobile hotspot and tethering", "saved networks", "wi-fi preferences", "network preferences",
-        "wlan", "portable wi-fi hotspot", "personal hotspot"
+        "wlan", "portable wi-fi hotspot", "personal hotspot",
+        "pair new device", "pairing", "bluetooth pairing", "available devices"
     )
 
     fun enabled(c: Context, key: String, default: Boolean = true) =
