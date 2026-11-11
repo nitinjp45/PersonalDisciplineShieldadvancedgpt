@@ -21,6 +21,7 @@ object Prefs {
     const val BLOCKED_APPS = "blocked_apps"
     const val SETTINGS_LOCKDOWN = "guard_settings_lockdown"
     const val WA_CHANNELS = "wa_channels"
+    const val DEBUG = "debug_dump"
     const val ALLOWED_SETTINGS = "allowed_settings_titles"
 
     val DEFAULT_ALLOWED_SETTINGS = setOf(
