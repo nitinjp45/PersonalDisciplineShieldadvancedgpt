@@ -11,8 +11,8 @@ android {
         applicationId = "com.personaldisciplineshield"
         minSdk = 23
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.4.0"
+        versionCode = 7
+        versionName = "0.4.5"
     }
 
     compileOptions {
