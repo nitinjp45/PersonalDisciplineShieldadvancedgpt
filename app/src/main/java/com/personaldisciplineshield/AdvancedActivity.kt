@@ -11,7 +11,6 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.text.InputType
-import android.view.View
 import android.widget.*
 
 class AdvancedActivity : Activity() {
@@ -26,7 +25,7 @@ class AdvancedActivity : Activity() {
     private lateinit var blockedAppsView: TextView
     private lateinit var lockdownStatusView: TextView
     private lateinit var waStatusView: TextView
-    private lateinit var dnsProviderStatus: TextView
+    private lateinit var dotView: TextView
     // Settings-type apps are handled by the Settings lockdown, never by the app blocker.
     private val hiddenApps: Set<String> by lazy {
         val home = packageManager.resolveActivity(
@@ -59,6 +58,7 @@ class AdvancedActivity : Activity() {
             addView(content)
         }
         setContentView(scroll)
+        Prefs.enforceStrictDns(this)
         build()
     }
 
@@ -91,13 +91,8 @@ class AdvancedActivity : Activity() {
 
     private fun ask(title: String, password: Boolean, onOk: (String) -> Unit) {
         val et = EditText(this).apply {
-            inputType = if (password) InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+            inputType = if (password) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             else InputType.TYPE_CLASS_TEXT
-            if (password) {
-                // Mask PIN digits and prevent keyboard suggestions/autofill.
-                isSingleLine = true
-                importantForAutofill = android.view.View.IMPORTANT_FOR_AUTOFILL_NO
-            }
         }
         AlertDialog.Builder(this).setTitle(title).setView(et)
             .setPositiveButton("OK") { _, _ -> onOk(et.text.toString().trim()) }
@@ -112,25 +107,33 @@ class AdvancedActivity : Activity() {
         })
 
         // ---- Lock ----
-        section("IMPULSE LOCK (PIN + waiting time)")
+        section("IMPULSE LOCK (password + waiting time)")
         lockStatus = TextView(this).apply { textSize = 14f }
         content.addView(lockStatus)
-        content.addView(button("Set / change PIN") {
+        content.addView(button("Set / change password") {
             if (Guard.hasPin(this) && !Guard.require(this)) return@button
-            ask("New PIN (6+ digits)", true) { pin ->
-                if (pin.length < 6) toast("PIN must be at least 6 digits")
-                else { Guard.setPin(this, pin); toast("PIN set. Protection is now locked."); refresh() }
+            ask("New password (${Guard.MIN_LENGTH}+ characters; letters, numbers, symbols)", true) { first ->
+                if (first.length < Guard.MIN_LENGTH) { toast("At least ${Guard.MIN_LENGTH} characters"); return@ask }
+                ask("Type the password again", true) { second ->
+                    if (first != second) toast("Passwords did not match, nothing changed")
+                    else { Guard.setPin(this, first); toast("Password set. Protection is now locked."); refresh() }
+                }
             }
         }, lp())
         content.addView(button("Request unlock (starts ${Guard.DELAY_MS / 60000}-min wait)") {
-            if (!Guard.hasPin(this)) { toast("Set a PIN first"); return@button }
-            ask("Enter PIN", true) { pin ->
-                if (Guard.checkPin(this, pin)) { Guard.requestUnlock(this); toast("Unlock opens after the wait"); refresh() }
-                else toast("Wrong PIN")
+            if (!Guard.hasPin(this)) { toast("Set a password first"); return@button }
+            val wait = Guard.lockoutMs(this)
+            if (wait > 0) { toast("Too many wrong attempts. Try again in ${wait / 60000 + 1} min"); return@button }
+            ask("Enter password", true) { pw ->
+                if (Guard.checkPin(this, pw)) { Guard.requestUnlock(this); toast("Unlock opens after the wait"); refresh() }
+                else {
+                    val w = Guard.lockoutMs(this)
+                    toast(if (w > 0) "Wrong password. Locked out for ${w / 60000 + 1} min" else "Wrong password")
+                }
             }
         }, lp())
         content.addView(button("Lock now") { Guard.lock(this); refresh() }, lp())
-        content.addView(note("Tip: ask a trusted person to set the PIN so you do not know it."))
+        content.addView(note("Tip: ask a trusted person to set the password so you do not know it. New passwords need ${Guard.MIN_LENGTH}+ characters (a password set earlier keeps working until you change it). After 5 wrong tries you are locked out for a while."))
 
         // ---- Device admin ----
         section("DEVICE ADMIN (uninstall speed-bump + screen lock)")
@@ -158,7 +161,7 @@ class AdvancedActivity : Activity() {
         toggle("Guard Settings / uninstall screens", Prefs.SETTINGS_GUARD, true)
 
         // ---- MIUI / Redmi helpers ----
-        section("MIUI / REDMI SETUP (do this BEFORE setting the PIN)")
+        section("MIUI / REDMI SETUP (do this BEFORE setting the password)")
         content.addView(button("1. Autostart: turn ON for this app") {
             openOrDetails(Intent().setClassName("com.miui.securitycenter",
                 "com.miui.permcenter.autostart.AutoStartManagementActivity"))
@@ -172,121 +175,6 @@ class AdvancedActivity : Activity() {
         content.addView(button("App details page") { openOrDetails(null) }, lp())
         content.addView(note("3. Open Recents, then long-press (or pull down on) this app's card and tap the lock icon so 'Clear all' cannot kill it. MIUI otherwise stops the VPN and the accessibility service in the background."))
 
-        // ---- Encrypted DNS provider ----
-        section("DNS PROVIDER (ENCRYPTED DNS-OVER-TLS)")
-        content.addView(note(
-            "Choose which encrypted DNS provider handles all DNS queries forwarded by Shield. " +
-                "Provider changes apply to the next DNS query while the VPN is running. " +
-                "There is no plaintext DNS fallback."
-        ))
-
-        val dnsProviderIds = listOf(
-            "nextdns",
-            "cloudflare",
-            "cloudflare_security",
-            "cloudflare_family",
-            "quad9",
-            "google",
-            "adguard",
-            "custom"
-        )
-        val dnsProviderLabels = listOf(
-            "NextDNS – private profile",
-            "Cloudflare – standard",
-            "Cloudflare – malware protection",
-            "Cloudflare – family (adult + malware)",
-            "Quad9 – malware protection",
-            "Google Public DNS",
-            "AdGuard DNS – ads and trackers",
-            "Custom DNS-over-TLS provider"
-        )
-
-        val dnsSpinner = Spinner(this)
-        val dnsAdapter = ArrayAdapter(
-            this,
-            android.R.layout.simple_spinner_item,
-            dnsProviderLabels
-        ).apply {
-            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        }
-        dnsSpinner.adapter = dnsAdapter
-        val currentDnsId = Prefs.getString(this, Prefs.DNS_PROVIDER) ?: "nextdns"
-        dnsSpinner.setSelection(dnsProviderIds.indexOf(currentDnsId).coerceAtLeast(0))
-        content.addView(dnsSpinner, lp())
-
-        val customDnsHost = EditText(this).apply {
-            hint = "DoT hostname, e.g. dns.example.com"
-            setSingleLine(true)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            setText(Prefs.getString(this@AdvancedActivity, Prefs.DNS_CUSTOM_HOST) ?: "")
-        }
-        val customDnsBootstrap = EditText(this).apply {
-            hint = "Bootstrap IPv4 IPs, comma-separated"
-            setSingleLine(true)
-            inputType = InputType.TYPE_CLASS_TEXT
-            setText(Prefs.getString(this@AdvancedActivity, Prefs.DNS_CUSTOM_BOOTSTRAP) ?: "")
-        }
-        val customDnsSave = button("Save custom DNS provider") {
-            val host = customDnsHost.text.toString().trim()
-            val bootstrap = customDnsBootstrap.text.toString().trim()
-            if (Prefs.saveCustomDns(this, host, bootstrap)) {
-                dnsSpinner.setSelection(dnsProviderIds.indexOf("custom"))
-                dnsProviderStatus.text =
-                    "Selected: Custom DoT – $host (applies to the next DNS query)"
-                toast("Custom DNS-over-TLS provider saved")
-            } else {
-                toast("Enter a valid hostname and one or more IPv4 bootstrap IPs")
-            }
-        }
-
-        val customVisibility = View.GONE
-        customDnsHost.visibility = customVisibility
-        customDnsBootstrap.visibility = customVisibility
-        customDnsSave.visibility = customVisibility
-        content.addView(customDnsHost, lp())
-        content.addView(customDnsBootstrap, lp())
-        content.addView(customDnsSave, lp())
-
-        dnsProviderStatus = TextView(this).apply {
-            textSize = 12f
-            setTextColor(0xFF6B7280.toInt())
-        }
-        content.addView(dnsProviderStatus, lp())
-
-        dnsSpinner.onItemSelectedListener =
-            object : android.widget.AdapterView.OnItemSelectedListener {
-                override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
-
-                override fun onItemSelected(
-                    parent: android.widget.AdapterView<*>?,
-                    view: android.view.View?,
-                    position: Int,
-                    id: Long
-                ) {
-                    val providerId = dnsProviderIds[position]
-                    val isCustom = providerId == "custom"
-
-                    customDnsHost.visibility = if (isCustom) View.VISIBLE else View.GONE
-                    customDnsBootstrap.visibility = if (isCustom) View.VISIBLE else View.GONE
-                    customDnsSave.visibility = if (isCustom) View.VISIBLE else View.GONE
-
-                    if (!isCustom) {
-                        Prefs.setDnsProvider(this@AdvancedActivity, providerId)
-                        val endpoint = Prefs.dnsEndpoint(this@AdvancedActivity)
-                        dnsProviderStatus.text = endpoint?.let {
-                            "Selected: ${it.label}  |  ${it.hostname}:853"
-                        } ?: "Selected DNS provider is invalid"
-                    } else {
-                        dnsProviderStatus.text =
-                            "Custom DoT requires a hostname and numeric bootstrap IPv4 address(es)."
-                    }
-                }
-            }
-
-        Prefs.dnsEndpoint(this)?.let {
-            dnsProviderStatus.text = "Selected: ${it.label}  |  ${it.hostname}:853"
-        }
-
         // ---- Settings lockdown ----
         section("SETTINGS APP LOCKDOWN (allow only some pages)")
         toggle("Lock Settings app (only pages listed below stay open)", Prefs.SETTINGS_LOCKDOWN, false) { refresh() }
@@ -295,7 +183,7 @@ class AdvancedActivity : Activity() {
         content.addView(button("Open Wi-Fi settings") { openSettings(Settings.ACTION_WIFI_SETTINGS) }, lp())
         content.addView(button("Open Bluetooth settings") { openSettings(Settings.ACTION_BLUETOOTH_SETTINGS) }, lp())
         content.addView(button("Open Hotspot settings") { openHotspot() }, lp())
-        content.addView(note("Wi-Fi, Bluetooth and Hotspot also work from the Quick Settings tiles (swipe down); those are never blocked. Long-press a tile to open its page. Settings lockdown remains active whenever this switch is ON, regardless of the main Protection LOCKED/UNLOCKED state."))
+        content.addView(note("Wi-Fi, Bluetooth and Hotspot also work from the Quick Settings tiles (swipe down); those are never blocked. Long-press a tile to open its page. Lockdown is active whenever the switch is ON; once a password is set it also pauses during the unlock window."))
         val allowInput = EditText(this).apply { hint = "allowed page title, e.g. wi-fi"; setSingleLine(true) }
         content.addView(allowInput, lp())
         content.addView(button("Allow this Settings page title") {
@@ -356,6 +244,13 @@ class AdvancedActivity : Activity() {
         imageStatus = TextView(this).apply { textSize = 13f }
         content.addView(imageStatus)
         content.addView(note("Needs Android 11+ and a model file at assets/nsfw.tflite. Accuracy depends on the model; expect misses and false alarms."))
+
+        // ---- Encrypted DNS ----
+        section("ENCRYPTED DNS (DNS-over-TLS)")
+        dotView = TextView(this).apply { textSize = 13f }
+        content.addView(dotView)
+        content.addView(button("Change DNS provider") { chooseDnsProvider() }, lp())
+        content.addView(note("All DNS queries use the selected provider over verified TLS on port 853. Strict mode is always ON: if the selected provider cannot be reached, DNS queries fail rather than falling back to unencrypted DNS or another provider. Some networks block port 853."))
 
         // ---- Diagnostics ----
         section("DIAGNOSTICS (use this if something does not block)")
@@ -462,9 +357,95 @@ class AdvancedActivity : Activity() {
         return s.contains(packageName + "/" + ShieldAccessibilityService::class.java.name)
     }
 
+    private fun chooseDnsProvider() {
+        val providers = Prefs.DNS_PROVIDERS
+        val labels = providers.map { it.label }.toMutableList().apply {
+            add("Custom DNS-over-TLS")
+        }
+        val current = Prefs.getString(this, Prefs.DNS_PROVIDER) ?: "nextdns"
+        val selected = providers.indexOfFirst { it.id == current }
+            .let { if (it >= 0) it else if (current == "custom") providers.size else 0 }
+
+        AlertDialog.Builder(this)
+            .setTitle("DNS provider")
+            .setSingleChoiceItems(labels.toTypedArray(), selected) { dialog, which ->
+                if (which == providers.size) {
+                    dialog.dismiss()
+                    showCustomDnsDialog()
+                } else {
+                    Prefs.putString(this, Prefs.DNS_PROVIDER, providers[which].id)
+                    Prefs.enforceStrictDns(this)
+                    refresh()
+                    dialog.dismiss()
+                    toast("DNS provider changed to ${providers[which].label}")
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showCustomDnsDialog() {
+        val hostInput = EditText(this).apply {
+            hint = "DoT hostname, e.g. dns.example.com"
+            singleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setText(Prefs.getString(this@AdvancedActivity, Prefs.DNS_CUSTOM_HOST).orEmpty())
+        }
+        val bootstrapInput = EditText(this).apply {
+            hint = "Bootstrap IPv4 addresses, comma-separated"
+            singleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(Prefs.getString(this@AdvancedActivity, Prefs.DNS_CUSTOM_BOOTSTRAP).orEmpty())
+        }
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(4))
+            addView(TextView(this@AdvancedActivity).apply {
+                text = "Hostname used for TLS certificate verification"
+                textSize = 12f
+            })
+            addView(hostInput, lp())
+            addView(TextView(this@AdvancedActivity).apply {
+                text = "Bootstrap IPs let the app connect without first resolving the hostname. Enter at least one IPv4 address."
+                textSize = 12f
+            })
+            addView(bootstrapInput, lp())
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Custom DNS-over-TLS")
+            .setView(panel)
+            .setPositiveButton("Save") { _, _ ->
+                val host = hostInput.text.toString().trim().trimEnd('.')
+                val ips = bootstrapInput.text.toString()
+                    .split(',')
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .distinct()
+
+                if (!Prefs.validDnsHostname(host)) {
+                    toast("Enter a valid DNS hostname")
+                    return@setPositiveButton
+                }
+                if (ips.isEmpty() || ips.any { !Prefs.validIpv4(it) }) {
+                    toast("Enter one or more valid IPv4 bootstrap addresses")
+                    return@setPositiveButton
+                }
+
+                Prefs.putString(this, Prefs.DNS_CUSTOM_HOST, host)
+                Prefs.putString(this, Prefs.DNS_CUSTOM_BOOTSTRAP, ips.joinToString(","))
+                Prefs.putString(this, Prefs.DNS_PROVIDER, "custom")
+                Prefs.enforceStrictDns(this)
+                refresh()
+                toast("Custom DNS-over-TLS provider saved")
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun refresh() {
         lockStatus.text = when {
-            !Guard.hasPin(this) -> "Lock: NOT ARMED (set a PIN to arm)"
+            !Guard.hasPin(this) -> "Lock: NOT ARMED (set a password to arm)"
             Guard.isUnlocked(this) -> "Lock: UNLOCKED, closes in ${Guard.openRemainingMs(this) / 60000 + 1} min"
             Guard.waitingMs(this) > 0 -> "Lock: unlock pending, opens in ${Guard.waitingMs(this) / 60000 + 1} min"
             else -> "Lock: LOCKED"
@@ -477,6 +458,12 @@ class AdvancedActivity : Activity() {
         val hasModel = try { assets.list("")?.contains("nsfw.tflite") == true } catch (_: Exception) { false }
         imageStatus.text = "Model: ${if (hasModel) "found" else "missing"}  |  Android 11+: ${Build.VERSION.SDK_INT >= 30}"
         blockedView.text = "Last blocked Settings screen: ${Prefs.getString(this, "last_settings_block") ?: "none yet"}"
+        val dnsProvider = Prefs.dnsProvider(this)
+        dotView.text = "Provider: ${dnsProvider.label}\n" +
+            "TLS hostname: ${dnsProvider.hostname}\n" +
+            "Mode: STRICT encrypted DNS (port 853); no plaintext or provider fallback\n" +
+            "Encrypted queries: ${Prefs.count(this, "dns_encrypted")}   strict failures: ${Prefs.count(this, "dns_strict_failures")}\n" +
+            "Last DNS result: ${Prefs.lastDnsError(this)}"
         val blockedNow = Prefs.strings(this, Prefs.BLOCKED_APPS).map { appLabel(it) }.sorted()
         blockedAppsView.text = if (blockedNow.isEmpty()) "Blocked apps: none" else "Blocked apps: " + blockedNow.joinToString(", ")
         val armed = Guard.hasPin(this)
@@ -485,11 +472,12 @@ class AdvancedActivity : Activity() {
         val lockdownActive = lockdownOn
         lockdownStatusView.text = when {
             !lockdownOn -> "Status: OFF (switch is off)"
-            else -> "Status: ACTIVE (independent of main Protection status)"
+            !armed -> "Status: ACTIVE (no password set; switch it off here to get Settings back)"
+            else -> "Status: ACTIVE (independent of main protection unlock)"
         }
         waStatusView.text = "Last WhatsApp block: ${Prefs.getString(this, "last_wa_block") ?: "none yet"}"
         diagView.text = "Accessibility service enabled: ${a11yEnabled()}\n" +
-            "PIN set: $armed   unlocked right now: ${Guard.isUnlocked(this)}\n" +
+            "Password set: $armed   unlocked right now: ${Guard.isUnlocked(this)}\n" +
             "Settings lockdown switch: $lockdownOn   guard switch: $guardOn\n" +
             "=> Settings lockdown active now: $lockdownActive\n" +
             "WhatsApp channel block switch: ${Prefs.enabled(this, Prefs.WA_CHANNELS, true)}\n" +
