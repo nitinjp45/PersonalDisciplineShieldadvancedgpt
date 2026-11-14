@@ -18,6 +18,7 @@ object Guard {
 
     const val DELAY_MS = 15 * 60 * 1000L   // change to taste (e.g. 24h = 24*60*60*1000L)
     const val WINDOW_MS = 5 * 60 * 1000L
+    const val MIN_LENGTH = 16
 
     fun hasPin(c: Context) = Prefs.getString(c, PIN_HASH) != null
 
