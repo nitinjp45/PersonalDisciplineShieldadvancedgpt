@@ -37,17 +37,15 @@ class ShieldAccessibilityService : AccessibilityService() {
     // Includes MIUI Security app and Battery (powerkeeper): permissions/autostart/force-stop screens live there.
     private val lockdownPackages = setOf(
         "com.android.settings", "com.oplus.settings", "com.coloros.settings",
-        "com.miui.securitycenter", "com.miui.powerkeeper"
+        "com.miui.securitycenter", "com.miui.powerkeeper", "com.xiaomi.misettings"
     )
-
-    // Rows of the Settings home / category lists (stock Android + MIUI).
+    // Rows of the Settings home / category lists (stock Android + MIUI). If any is on screen it is a list, not an allowed page.
     private val homepageMarkers = setOf(
         "mobile networks", "sim cards & mobile networks", "connection & sharing",
         "network & internet", "connected devices", "passwords & security",
         "additional settings", "about phone", "lock screen & password", "special features"
     )
-
-    // Never blockable by the app-block list.
+    // Never blockable by the app-block list (would break Settings, permissions, installers, calling, launcher).
     private val protectedPackages = setOf(
         "com.android.settings", "com.miui.securitycenter", "com.miui.powerkeeper",
         "com.android.systemui", "com.android.phone", "com.android.server.telecom",
@@ -56,21 +54,16 @@ class ShieldAccessibilityService : AccessibilityService() {
         "com.miui.packageinstaller", "com.coloros.safecenter", "com.oplus.settings",
         "com.android.providers.settings"
     )
-
     private fun isProtectedPackage(pkg: String) =
         pkg == packageName || pkg == launcherPkg || pkg in protectedPackages
-
-    // Activity class-name fragments that are always allowed.
-    private val allowedClassTokens = listOf(
-        "wifi", "bluetooth", "tether", "hotspot",
-        "networkprovider", "settingspanel"
-    )
-
+    // Activity class-name fragments that are always allowed (Wi-Fi, Bluetooth, hotspot pages and panels)
+    private val allowedClassTokens = listOf("wifi", "bluetooth", "tether", "hotspot", "networkprovider", "settingspanel", "pairing")
+    // Texts shown by pairing / connect dialogs (matched as a part of the text).
+    private val allowedPhrases = listOf("bluetooth pairing", "pairing request", "pairing code", "pair with", "pair and connect")
     private var lastStateChange = 0L
     private var lastLockdownScan = 0L
     private var lastSettingsClass = ""
     private var settingsRecheckPending = false
-    private var settingsRecheckAttempts = 0
 
     // WhatsApp
     private val whatsappPkgs = setOf("com.whatsapp", "com.whatsapp.w4b")
@@ -111,118 +104,76 @@ class ShieldAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
         e ?: return
         val pkg = e.packageName?.toString() ?: return
-
         heartbeat(e, pkg)
-
         if (pkg == packageName || pkg == "com.android.systemui") return
-
         val type = e.eventType
 
-        if (
-            Prefs.enabled(this, Prefs.DEBUG, false) &&
-            (pkg in whatsappPkgs || pkg in lockdownPackages)
-        ) {
-            dumpScreen(e, pkg)
-        }
+        if (Prefs.enabled(this, Prefs.DEBUG, false) && (pkg in whatsappPkgs || pkg in lockdownPackages)) dumpScreen(e, pkg)
 
         // 1) Blocked apps
-        if (
-            type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             Prefs.enabled(this, Prefs.APPS_ON, true) &&
-            !isProtectedPackage(pkg) &&
-            pkg in Prefs.strings(this, Prefs.BLOCKED_APPS)
+            !isProtectedPackage(pkg) && pkg in Prefs.strings(this, Prefs.BLOCKED_APPS)
         ) {
-            punish("app blocked")
-            return
+            punish("app blocked"); return
         }
 
         // 2) Settings / uninstall guard
         if (pkg in settingsPackages && guardActive()) {
-            if (scanSettings()) {
-                punish("protected screen")
-                return
-            }
+            if (scanSettings()) { punish("protected screen"); return }
         }
 
-        // 2b) Settings app lockdown.
-        // Independent of main Protection LOCKED/UNLOCKED status.
+        // 2b) Settings app lockdown: only allow-listed pages (Wi-Fi, Bluetooth, hotspot...)
         if (pkg in lockdownPackages && lockdownActive()) {
-            if (settingsLockdown(e)) {
-                punish("settings locked")
-                return
+            if (
+                type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+                type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+                type == AccessibilityEvent.TYPE_WINDOWS_CHANGED
+            ) {
+                if (settingsLockdown(e)) { punish("settings locked"); return }
             }
         }
 
-        // 2c) WhatsApp: block the complete Updates tab.
-        if (
-            pkg in whatsappPkgs &&
-            Prefs.enabled(this, Prefs.WA_CHANNELS, true)
-        ) {
+        // 2c) WhatsApp: keep chats, block Channels / Updates tab
+        if (pkg in whatsappPkgs && Prefs.enabled(this, Prefs.WA_CHANNELS, true)) {
             if (checkWhatsApp(e)) return
         }
 
         // 3) Keywords
-        if (
-            Prefs.enabled(this, Prefs.KEYWORDS_ON, true) &&
-            !e.isPassword
-        ) {
-            if (checkKeywords(e, pkg)) {
-                punish("blocked keyword")
-                return
-            }
+        if (Prefs.enabled(this, Prefs.KEYWORDS_ON, true) && !e.isPassword) {
+            if (checkKeywords(e, pkg)) { punish("blocked keyword"); return }
         }
 
         // 4) Images (optional)
-        if (
-            type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+        if (type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
             type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-        ) {
-            maybeScreenshot(pkg)
-        }
+        ) maybeScreenshot(pkg)
     }
 
     override fun onInterrupt() {}
 
     // ---------- Settings guard ----------
-
     private fun guardActive() =
         Prefs.enabled(this, Prefs.SETTINGS_GUARD, true) &&
-            Guard.hasPin(this) &&
-            !Guard.isUnlocked(this)
+            Guard.hasPin(this) && !Guard.isUnlocked(this)
 
     private fun scanSettings(): Boolean {
         val now = SystemClock.elapsedRealtime()
-
         if (now - lastScan < 250) return false
-
         lastScan = now
-
         val root = rootInActiveWindow ?: return false
-
         val sb = StringBuilder()
         collectText(root, sb, intArrayOf(500), 0)
-
         val text = sb.toString().lowercase()
-
-        val label = applicationInfo
-            .loadLabel(packageManager)
-            .toString()
-            .lowercase()
-
+        val label = applicationInfo.loadLabel(packageManager).toString().lowercase()
+        // "private dns" is English-only; the app label matches on any language.
         return text.contains(label) || text.contains("private dns")
     }
 
-    private fun collectText(
-        n: AccessibilityNodeInfo,
-        sb: StringBuilder,
-        budget: IntArray,
-        depth: Int
-    ) {
+    private fun collectText(n: AccessibilityNodeInfo, sb: StringBuilder, budget: IntArray, depth: Int) {
         if (budget[0]-- <= 0 || depth > 30) return
-
         n.text?.let { sb.append(it).append('\n') }
         n.contentDescription?.let { sb.append(it).append('\n') }
-
         for (i in 0 until n.childCount) {
             val ch = n.getChild(i) ?: continue
             collectText(ch, sb, budget, depth + 1)
@@ -230,138 +181,72 @@ class ShieldAccessibilityService : AccessibilityService() {
     }
 
     // ---------- Diagnostics ----------
-
     private fun heartbeat(e: AccessibilityEvent, pkg: String) {
         val now = SystemClock.elapsedRealtime()
-
         if (now - lastBeat < 1000) return
-
         lastBeat = now
-
-        val time = java.text.SimpleDateFormat(
-            "HH:mm:ss",
-            java.util.Locale.US
-        ).format(java.util.Date())
-
-        Prefs.putString(
-            this,
-            "dbg_last_event",
-            "$time  $pkg  ${e.className}"
-        )
+        val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+        Prefs.putString(this, "dbg_last_event", "$time  $pkg  ${e.className}")
     }
 
-    /** Saves visible screen text only while Diagnostics is switched on. */
+    /** Saves what the service can see on screen (only while Diagnostics is switched on). */
     private fun dumpScreen(e: AccessibilityEvent, pkg: String) {
         val now = SystemClock.elapsedRealtime()
-
         if (now - lastDump < 1500) return
-
         lastDump = now
-
         val root = rootInActiveWindow ?: return
-
         val h = resources.displayMetrics.heightPixels.coerceAtLeast(1)
         val parts = ArrayList<String>()
-
-        fun walk(
-            n: AccessibilityNodeInfo,
-            depth: Int,
-            budget: IntArray
-        ) {
+        fun walk(n: AccessibilityNodeInfo, depth: Int, budget: IntArray) {
             if (budget[0]-- <= 0 || depth > 30 || parts.size > 60) return
-
             val t = n.text?.toString()?.trim().orEmpty()
             val d = n.contentDescription?.toString()?.trim().orEmpty()
-
             val label = (t + if (d.isNotEmpty()) " [$d]" else "").trim()
-
             if (label.isNotEmpty()) {
                 val r = Rect()
                 n.getBoundsInScreen(r)
-
-                parts.add(
-                    "${r.top * 100 / h}%: ${label.take(40)}" +
-                        if (n.isSelected) " (selected)" else ""
-                )
+                parts.add("${r.top * 100 / h}%: ${label.take(40)}${if (n.isSelected) " (selected)" else ""}")
             }
-
-            for (i in 0 until n.childCount) {
-                n.getChild(i)?.let {
-                    walk(it, depth + 1, budget)
-                }
-            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, depth + 1, budget) }
         }
-
         walk(root, 0, intArrayOf(300))
-
-        val key = if (pkg in whatsappPkgs) {
-            "dbg_screen_wa"
-        } else {
-            "dbg_screen_settings"
-        }
-
-        Prefs.putString(
-            this,
-            key,
-            "$pkg | ${e.className}\n" +
-                parts.joinToString("\n").take(1500)
-        )
+        val key = if (pkg in whatsappPkgs) "dbg_screen_wa" else "dbg_screen_settings"
+        Prefs.putString(this, key, "$pkg | ${e.className}\n" + parts.joinToString("\n").take(1500))
     }
 
     // ---------- Settings lockdown (allow-list) ----------
-
-    // Independent of main Protection LOCKED/UNLOCKED state.
+    // Settings lockdown is deliberately independent of the main Protection unlock window.
     private fun lockdownActive() =
         Prefs.enabled(this, Prefs.SETTINGS_LOCKDOWN, false)
 
-    /** Returns true when the current Settings screen must be blocked. */
+    /** Evaluate the current Settings page on every relevant accessibility event. */
     private fun settingsLockdown(e: AccessibilityEvent): Boolean {
         val now = SystemClock.elapsedRealtime()
-
-        val isState =
-            e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-
+        val isState = e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
         val cls = e.className?.toString()?.lowercase().orEmpty()
 
         if (isState) {
             lastStateChange = now
             lastSettingsClass = cls
-            settingsRecheckAttempts = 0
         }
 
-        if (!isState && now - lastLockdownScan < 120) {
-            return false
-        }
-
+        if (!isState && now - lastLockdownScan < 140L) return false
         lastLockdownScan = now
 
         val root = rootInActiveWindow
-
         if (root == null) {
             scheduleSettingsRecheck()
             return false
         }
 
         val rootPkg = root.packageName?.toString()
-
-        if (rootPkg != null && rootPkg !in lockdownPackages) {
-            return false
-        }
-
-        // Class identifiers are positive evidence only.
-        // Do not cache an allow decision.
-        val classAllowed = allowedClassTokens.any {
-            cls.contains(it)
-        }
+        if (rootPkg != null && rootPkg !in lockdownPackages) return false
 
         val header = headerTexts(root)
+        if (isAllowedSettingsPage(cls, header)) return false
 
-        if (classAllowed || headerAllowed(header)) {
-            return false
-        }
-
-        // Allow MIUI to finish drawing before checking again.
-        if (now - lastStateChange < 1000L) {
+        // Wait briefly for MIUI/Android to finish rendering a newly opened page.
+        if (now - lastStateChange < 350L) {
             scheduleSettingsRecheck()
             return false
         }
@@ -372,77 +257,47 @@ class ShieldAccessibilityService : AccessibilityService() {
 
     private fun scheduleSettingsRecheck() {
         if (settingsRecheckPending) return
-
         settingsRecheckPending = true
-
         handler.postDelayed({
             settingsRecheckPending = false
             recheckSettings()
-        }, 400L)
+        }, 380L)
     }
 
     private fun recheckSettings() {
         if (!lockdownActive()) return
-
-        val root = rootInActiveWindow
-
-        if (root == null) {
-            if (settingsRecheckAttempts++ < 3) {
-                scheduleSettingsRecheck()
-            }
-            return
-        }
-
-        val p = root.packageName?.toString() ?: return
-
-        if (p !in lockdownPackages) return
-
-        val clsAllowed = allowedClassTokens.any {
-            lastSettingsClass.contains(it)
-        }
+        val root = rootInActiveWindow ?: return
+        val pkg = root.packageName?.toString() ?: return
+        if (pkg !in lockdownPackages) return
 
         val header = headerTexts(root)
-
-        if (clsAllowed || headerAllowed(header)) return
-
-        if (
-            SystemClock.elapsedRealtime() - lastStateChange < 1000L &&
-            settingsRecheckAttempts++ < 3
-        ) {
-            scheduleSettingsRecheck()
-            return
-        }
+        if (isAllowedSettingsPage(lastSettingsClass, header)) return
 
         recordBlock(header)
         punish("settings locked")
     }
 
-    private fun headerAllowed(header: List<String>): Boolean {
-        // Settings home must not be mistaken for an allowed Wi-Fi/Bluetooth page.
-        if (
-            header.any { marker ->
-                homepageMarkers.any { marker.contains(it) }
-            }
-        ) {
-            return false
+    private fun isAllowedSettingsPage(cls: String, header: List<String>): Boolean {
+        val classAllowed = allowedClassTokens.any { cls.contains(it) }
+        if (classAllowed) return true
+
+        // A Settings home/category list is never an allowed page, even if it contains
+        // Wi-Fi/Bluetooth rows lower in the hierarchy.
+        val homeMarkerCount = header.count { h ->
+            homepageMarkers.any { marker -> h.contains(marker) }
         }
+        if (homeMarkerCount >= 2) return false
 
         val allowed = Prefs.allowedSettings(this)
-
-        // Allow Bluetooth pairing screens.
-        val pairingFlow = header.any { h ->
-            h.contains("pair new device") ||
-                h.contains("pairing") ||
-                h.contains("available devices") ||
-                h.contains("bluetooth")
+        val pairing = header.any { h ->
+            allowedPhrases.any { phrase -> h.contains(phrase) } ||
+                h.contains("pair new device") ||
+                h.contains("available devices")
         }
-
-        if (pairingFlow) return true
+        if (pairing) return true
 
         return header.any { h ->
-            allowed.any { token ->
-                h == token || h.contains(token)
-            }
+            allowed.any { token -> h == token || h.contains(token) }
         }
     }
 
@@ -458,146 +313,77 @@ class ShieldAccessibilityService : AccessibilityService() {
     private fun headerTexts(root: AccessibilityNodeInfo): List<String> {
         val limit = resources.displayMetrics.heightPixels * 0.38
         val out = ArrayList<String>()
-
-        fun walk(
-            n: AccessibilityNodeInfo,
-            depth: Int,
-            budget: IntArray
-        ) {
+        fun walk(n: AccessibilityNodeInfo, depth: Int, budget: IntArray) {
             if (budget[0]-- <= 0 || depth > 30) return
-
             val t = n.text?.toString()?.trim()?.lowercase()
             val d = n.contentDescription?.toString()?.trim()?.lowercase()
-
             val r = Rect()
             n.getBoundsInScreen(r)
-
             if (r.top < limit && r.bottom > 0) {
                 if (!t.isNullOrEmpty() && t.length <= 60) out.add(t)
                 if (!d.isNullOrEmpty() && d.length <= 60) out.add(d)
             }
-
-            for (i in 0 until n.childCount) {
-                n.getChild(i)?.let {
-                    walk(it, depth + 1, budget)
-                }
-            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, depth + 1, budget) }
         }
-
         walk(root, 0, intArrayOf(400))
-
         return out
     }
 
-    // ---------- WhatsApp: block Channels / Updates tab ----------
-
+    // ---------- WhatsApp: block the complete Updates tab (Status + Channels) ----------
     private fun checkWhatsApp(e: AccessibilityEvent): Boolean {
         val cls = e.className?.toString()?.lowercase().orEmpty()
-
         val root = rootInActiveWindow
         val rootPkg = root?.packageName?.toString()
-
-        if (rootPkg != null && rootPkg !in whatsappPkgs) {
-            return false
-        }
+        if (rootPkg != null && rootPkg !in whatsappPkgs) return false
 
         val rule = if (cls.contains("newsletter")) {
-            "class:$cls"
+            "whatsapp-newsletter:$cls"
         } else {
             if (root == null) return false
-
-            channelsUi(
-                root,
-                false,
-                intArrayOf(700),
-                0
-            )
+            channelsUi(root, false, intArrayOf(700), 0)
         } ?: return false
 
         val now = SystemClock.elapsedRealtime()
-
-        // Consume events while the blocked tab is visible.
-        // Retry handles delayed UI updates without pausing protection.
-        if (now - lastWaAction >= 700L) {
+        if (now - lastWaAction >= 650L) {
             lastWaAction = now
-
-            Prefs.putString(
-                this,
-                "last_wa_block",
-                "$rule | $cls"
-            )
-
+            Prefs.putString(this, "last_wa_block", "$rule | $cls")
             val clicked = root != null && goToChatsTab(root)
-
-            if (!clicked && rule.startsWith("class:")) {
+            if (!clicked && rule.startsWith("whatsapp-newsletter:")) {
                 performGlobalAction(GLOBAL_ACTION_BACK)
             }
-
             Prefs.increment(this, "a11y_blocks")
-
-            Toast.makeText(
-                this,
-                "Shield: WhatsApp Updates blocked",
-                Toast.LENGTH_SHORT
-            ).show()
         }
 
+        // Recheck after WhatsApp finishes its tab animation. No timed pause/loop breaker.
         scheduleWhatsAppRetry()
-
         return true
     }
 
     private fun scheduleWhatsAppRetry() {
         if (waRetryPending) return
-
         waRetryPending = true
-
         handler.postDelayed({
             waRetryPending = false
-
-            if (!Prefs.enabled(this, Prefs.WA_CHANNELS, true)) {
-                return@postDelayed
-            }
+            if (!Prefs.enabled(this, Prefs.WA_CHANNELS, true)) return@postDelayed
 
             val root = rootInActiveWindow ?: return@postDelayed
-
             val pkg = root.packageName?.toString()
+            if (pkg == null || pkg !in whatsappPkgs) return@postDelayed
 
-            if (pkg == null || pkg !in whatsappPkgs) {
-                return@postDelayed
-            }
-
-            val rule = channelsUi(
-                root,
-                false,
-                intArrayOf(700),
-                0
-            ) ?: return@postDelayed
-
+            val rule = channelsUi(root, false, intArrayOf(700), 0) ?: return@postDelayed
             val now = SystemClock.elapsedRealtime()
-
-            if (now - lastWaAction >= 700L) {
+            if (now - lastWaAction >= 650L) {
                 lastWaAction = now
-
-                Prefs.putString(
-                    this,
-                    "last_wa_block",
-                    "retry:$rule"
-                )
-
-                if (!goToChatsTab(root)) {
-                    // Do not use Back for a mere text match.
-                    if (rule.startsWith("class:")) {
-                        performGlobalAction(GLOBAL_ACTION_BACK)
-                    }
-                }
+                Prefs.putString(this, "last_wa_block", "retry:$rule")
+                goToChatsTab(root)
             }
         }, 350L)
     }
 
     /**
-     * Detect the selected Updates tab, which contains both Status and Channels.
-     * Do not block a plain mention of Status or Channels elsewhere in WhatsApp.
+     * WhatsApp's Updates tab contains Status and Channels. Detect the selected
+     * Updates tab, including descriptions such as "Updates, selected" and
+     * selection exposed on a parent node. Do not block a normal Status mention.
      */
     private fun channelsUi(
         n: AccessibilityNodeInfo,
@@ -613,113 +399,59 @@ class ShieldAccessibilityService : AccessibilityService() {
         if (t in channelWords) return "phrase:$t"
         if (d in channelWords) return "phrase:$d"
 
-        val isUpdatesLabel =
-            t == "updates" ||
-                t.startsWith("updates,") ||
-                t.startsWith("updates ") ||
-                d == "updates" ||
-                d.startsWith("updates,") ||
-                d.startsWith("updates ")
+        val updatesLabel = t == "updates" || d == "updates" ||
+            t.startsWith("updates,") || d.startsWith("updates,") ||
+            t.startsWith("updates ") || d.startsWith("updates ")
 
-        // Some WhatsApp versions expose selection on the tab itself;
-        // others expose it on a clickable parent or as a checked state.
-        val selected = n.isSelected || n.isChecked || parentSelected
+        val selected = n.isSelected || n.isChecked || parentSelected ||
+            d.contains("selected") || t.contains("selected")
 
-        if (isUpdatesLabel && selected) {
-            return "updates-tab-selected"
-        }
+        if (updatesLabel && selected) return "updates-tab-selected"
 
-        val childParentSelected = n.isSelected || n.isChecked
-
+        val childSelected = n.isSelected || n.isChecked
         for (i in 0 until n.childCount) {
-            val c = n.getChild(i) ?: continue
-
-            val r = channelsUi(
-                c,
-                childParentSelected,
-                budget,
-                depth + 1
-            )
-
-            if (r != null) return r
+            val child = n.getChild(i) ?: continue
+            val result = channelsUi(child, childSelected, budget, depth + 1)
+            if (result != null) return result
         }
-
         return null
     }
 
     private fun goToChatsTab(root: AccessibilityNodeInfo): Boolean {
-        val found =
-            root.findAccessibilityNodeInfosByText("Chats") ?: return false
-
-        for (n in found) {
-            val label = n.text?.toString()?.trim()
-                ?: n.contentDescription?.toString()?.trim().orEmpty()
-
-            if (!label.equals("Chats", true)) continue
-
+        val found = root.findAccessibilityNodeInfosByText("Chats") ?: return false
+        val r = Rect()
+        val tabs = found.filter {
+            it.text?.toString()?.trim().equals("Chats", true) ||
+                it.contentDescription?.toString()?.trim()?.startsWith("Chats", true) == true
+        }.sortedByDescending { it.getBoundsInScreen(r); r.top }
+        for (n in tabs) {
             var c: AccessibilityNodeInfo? = n
             var hops = 0
-
-            while (c != null && !c.isClickable && hops++ < 5) {
-                c = c.parent
-            }
-
-            if (
-                c != null &&
-                c.isClickable &&
-                c.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            ) {
-                return true
-            }
+            while (c != null && !c.isClickable && hops++ < 4) c = c.parent
+            if (c != null && c.isClickable && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
         }
-
         return false
     }
 
     // ---------- Keywords ----------
-
-    private fun checkKeywords(
-        e: AccessibilityEvent,
-        pkg: String
-    ): Boolean {
-        val kws = Prefs.strings(this, Prefs.KEYWORDS)
-            .map { it.lowercase().trim() }
-            .filter { it.isNotEmpty() }
-
+    private fun checkKeywords(e: AccessibilityEvent, pkg: String): Boolean {
+        val kws = Prefs.strings(this, Prefs.KEYWORDS).map { it.lowercase().trim() }.filter { it.isNotEmpty() }
         if (kws.isEmpty()) return false
-
         val texts = ArrayList<String>()
-
         if (e.eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
-            e.text?.forEach {
-                texts.add(it.toString())
-            }
+            e.text?.forEach { texts.add(it.toString()) }
         }
-
         val root = rootInActiveWindow
-
         if (root != null) {
             for (id in browserUrlBars) {
                 if (!id.startsWith("$pkg:")) continue
-
                 root.findAccessibilityNodeInfosByViewId(id)?.forEach { n ->
-                    n.text?.let {
-                        texts.add(it.toString())
-                    }
+                    n.text?.let { texts.add(it.toString()) }
                 }
             }
-
-            val focused = root.findFocus(
-                AccessibilityNodeInfo.FOCUS_INPUT
-            )
-
-            if (focused != null && !focused.isPassword) {
-                focused.text?.let {
-                    texts.add(it.toString())
-                }
-            }
+            val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            if (focused != null && !focused.isPassword) focused.text?.let { texts.add(it.toString()) }
         }
-
         return texts.any { t ->
             val low = t.lowercase()
             kws.any { low.contains(it) }
@@ -727,110 +459,52 @@ class ShieldAccessibilityService : AccessibilityService() {
     }
 
     // ---------- Images ----------
-
     private fun maybeScreenshot(pkg: String) {
         if (Build.VERSION.SDK_INT < 30) return
         if (!Prefs.enabled(this, Prefs.IMAGE_ON, false)) return
         if (pkg == launcherPkg) return
-
         val clf = classifier ?: return
         val now = SystemClock.elapsedRealtime()
-
         if (shotBusy || now - lastShot < 2000) return
-
         shotBusy = true
         lastShot = now
-
-        takeScreenshot(
-            Display.DEFAULT_DISPLAY,
-            mainExecutor,
-            object : TakeScreenshotCallback {
-
-                override fun onSuccess(result: ScreenshotResult) {
-                    val hb = result.hardwareBuffer
-
-                    val bmp: Bitmap? = try {
-                        Bitmap.wrapHardwareBuffer(
-                            hb,
-                            result.colorSpace
-                        )?.copy(
-                            Bitmap.Config.ARGB_8888,
-                            false
-                        )
+        takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+            override fun onSuccess(result: ScreenshotResult) {
+                val hb = result.hardwareBuffer
+                val bmp: Bitmap? = try {
+                    Bitmap.wrapHardwareBuffer(hb, result.colorSpace)?.copy(Bitmap.Config.ARGB_8888, false)
+                } finally { hb.close() }
+                if (bmp == null) { shotBusy = false; return }
+                worker.execute {
+                    try {
+                        if (clf.score(bmp) >= imageThreshold) handler.post { punish("explicit image") }
+                    } catch (_: Exception) {
                     } finally {
-                        hb.close()
+                        bmp.recycle(); shotBusy = false
                     }
-
-                    if (bmp == null) {
-                        shotBusy = false
-                        return
-                    }
-
-                    worker.execute {
-                        try {
-                            if (clf.score(bmp) >= imageThreshold) {
-                                handler.post {
-                                    punish("explicit image")
-                                }
-                            }
-                        } catch (_: Exception) {
-                        } finally {
-                            bmp.recycle()
-                            shotBusy = false
-                        }
-                    }
-                }
-
-                override fun onFailure(errorCode: Int) {
-                    shotBusy = false
                 }
             }
-        )
+            override fun onFailure(errorCode: Int) { shotBusy = false }
+        })
     }
 
     // ---------- Reaction ----------
-
     private fun punish(reason: String) {
         val now = SystemClock.elapsedRealtime()
-
         if (now - lastAction < 700) return
-
         lastAction = now
-
         performGlobalAction(GLOBAL_ACTION_HOME)
-
-        Toast.makeText(
-            this,
-            "Shield: $reason",
-            Toast.LENGTH_SHORT
-        ).show()
-
+        Toast.makeText(this, "Shield: $reason", Toast.LENGTH_SHORT).show()
         Prefs.increment(this, "a11y_blocks")
 
         // 3 strikes in 5 minutes => lock the screen (needs Device Admin)
         strikes.add(now)
-
-        strikes.removeAll {
-            now - it > 5 * 60_000L
-        }
-
+        strikes.removeAll { now - it > 5 * 60_000L }
         if (strikes.size >= 3) {
             strikes.clear()
-
             val dpm = getSystemService(DevicePolicyManager::class.java)
-
-            if (
-                dpm?.isAdminActive(
-                    ComponentName(
-                        this,
-                        ShieldAdminReceiver::class.java
-                    )
-                ) == true
-            ) {
-                try {
-                    dpm.lockNow()
-                } catch (_: Exception) {
-                }
+            if (dpm?.isAdminActive(ComponentName(this, ShieldAdminReceiver::class.java)) == true) {
+                try { dpm.lockNow() } catch (_: Exception) {}
             }
         }
     }
